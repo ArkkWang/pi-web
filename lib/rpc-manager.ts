@@ -119,19 +119,7 @@ type ExtensionCommandContextActionsLike = {
 
 export interface ExternalSessionRegistration {
   session: AgentSessionLike;
-  isRunning: () => boolean;
-  send?: (command: {
-    type: "prompt" | "steer" | "follow_up";
-    message: string;
-    images?: Array<{ type: "image"; data: string; mimeType: string }>;
-    streamingBehavior?: "steer" | "followUp";
-  }) => unknown | Promise<unknown>;
-  stop?: () => unknown | Promise<unknown>;
 }
-
-const EXTERNAL_READ_COMMANDS = new Set([
-  "get_state", "get_tools", "get_commands", "get_session_stats", "get_last_assistant_text",
-]);
 
 type AgentSessionWrapperOptions = {
   external?: ExternalSessionRegistration;
@@ -316,6 +304,8 @@ export class AgentSessionWrapper {
   private extensionBindingError: unknown = null;
   private readonly exactSystemPrompt?: () => string;
   private externalFileDiscovered = false;
+  private externalReleasePromise: Promise<void> | null = null;
+  private resolveExternalRelease: (() => void) | null = null;
   private readonly external?: ExternalSessionRegistration;
   private readonly chatOnly: boolean;
   private readonly onAgentRunComplete?: AgentRunCompleteListener;
@@ -383,7 +373,7 @@ export class AgentSessionWrapper {
   isExternallyOwned(): boolean { return Boolean(this.external); }
 
   isRunning(): boolean {
-    return this._alive && (this.external?.isRunning() || this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
+    return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
   }
 
   /**
@@ -425,9 +415,6 @@ export class AgentSessionWrapper {
       }
       this.trackActiveToolEvent(event);
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
-      // SDK settlement can precede the owner's final bookkeeping. The existing
-      // state reconciliation/running snapshot observes that logical completion.
-      if (event.type === "agent_settled" && this.external?.isRunning()) return;
       this.emit(event);
       if (event.type === "agent_settled") this.notifyAgentRunCompleteIfIdle();
     });
@@ -732,28 +719,17 @@ export class AgentSessionWrapper {
   async send(command: Record<string, unknown>): Promise<unknown> {
     if (!this.isAlive()) throw new Error("Session is closed");
     const type = command.type as string;
-    if (this.external && !EXTERNAL_READ_COMMANDS.has(type)) {
-      if (type === "abort" || type === "abort_compaction" || type === "abort_bash") {
-        if (!this.external.stop) throw new Error("External session does not support Stop");
-        return await this.external.stop();
-      }
-      if (type === "prompt" || type === "steer" || type === "follow_up") {
-        if (!this.external.send) throw new Error("External session does not support sending messages");
-        if (typeof command.message !== "string") throw new Error("message must be a string");
-        const imageError = validateAgentImages(command.images);
-        if (imageError) throw new Error(imageError);
-        if (command.streamingBehavior !== undefined && command.streamingBehavior !== "steer" && command.streamingBehavior !== "followUp") {
-          throw new Error("Invalid streamingBehavior");
-        }
-        return await this.external.send({
-          type, message: command.message,
-          images: command.images as Parameters<NonNullable<ExternalSessionRegistration["send"]>>[0]["images"],
-          streamingBehavior: command.streamingBehavior as "steer" | "followUp" | undefined,
-        });
-      }
-      throw new Error(`External session command is managed by its owner: ${type}`);
+    // Protect owner-managed files/loadouts and extension bindings. Standalone
+    // bash is excluded: SDK idle/abort does not cover its shell lifecycle.
+    // Agent tool calls to bash are unaffected; other execution uses normal SDK paths.
+    if (this.external && ["set_tools", "reload", "set_session_name", "fork", "fork_branch", "clone", "navigate_tree", "bash"].includes(type)) {
+      throw new Error(`External session ownership prevents command: ${type}`);
     }
     const allowedDuringReplacement = COMMANDS_ALLOWED_DURING_SESSION_REPLACEMENT.has(type);
+    if (this.externalReleasePromise && !allowedDuringReplacement
+      && !["abort", "abort_compaction", "abort_bash", "abort_retry"].includes(type)) {
+      throw new Error("External session is releasing");
+    }
     if (this.sessionReplacement && !allowedDuringReplacement) {
       throw new Error("Session is being copied to a new session");
     }
@@ -817,6 +793,7 @@ export class AgentSessionWrapper {
             this.pendingPromptCount = Math.max(0, this.pendingPromptCount - 1);
             this.resetIdleTimer();
             this.notifyAgentRunCompleteIfIdle();
+            this.finishExternalReleaseIfDrained();
           };
 
           this.pendingPromptCount += 1;
@@ -926,7 +903,7 @@ export class AgentSessionWrapper {
           sessionId: this.inner.sessionId,
           sessionFile: this.inner.sessionFile ?? "",
           isStreaming: this.inner.isStreaming,
-          isPromptRunning: Boolean(this.external?.isRunning()) || this.pendingPromptCount > 0,
+          isPromptRunning: this.pendingPromptCount > 0,
           isBashRunning: this.inner.isBashRunning,
           isCompacting: this.inner.isCompacting,
           autoCompactionEnabled: this.inner.autoCompactionEnabled,
@@ -1242,7 +1219,7 @@ export class AgentSessionWrapper {
       }
 
       case "bash": {
-        if (this.external?.isRunning() || this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning) {
+        if (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning) {
           throw new Error("Cannot run a shell command while the session is busy");
         }
         const execution = this.inner.executeBash(
@@ -1277,6 +1254,7 @@ export class AgentSessionWrapper {
       }
     } finally {
       if (tracksMutation) this.activeMutatingCommands = Math.max(0, this.activeMutatingCommands - 1);
+      this.finishExternalReleaseIfDrained();
     }
   }
 
@@ -1295,9 +1273,22 @@ export class AgentSessionWrapper {
     }
   }
 
-  /** Only the registration owner may detach an externally owned session. */
-  releaseExternal(): void {
-    if (!this.external || !this._alive) return;
+  /** Drain Web-admitted work before detaching. This does not cancel SDK work. */
+  releaseExternal(): Promise<void> {
+    if (this.externalReleasePromise) return this.externalReleasePromise;
+    if (!this.external || !this._alive) return Promise.resolve();
+    this.externalReleasePromise = new Promise<void>((resolve) => {
+      this.resolveExternalRelease = resolve;
+    });
+    this.finishExternalReleaseIfDrained();
+    return this.externalReleasePromise;
+  }
+
+  private finishExternalReleaseIfDrained(): void {
+    if (!this.resolveExternalRelease || this.pendingPromptCount > 0 || this.activeMutatingCommands > 0) return;
+    // Remain alive and registered until this point so no second SDK can open.
+    const resolve = this.resolveExternalRelease;
+    this.resolveExternalRelease = null;
     this._alive = false;
     this.unsubscribe?.();
     this.unsubscribe = null;
@@ -1307,6 +1298,7 @@ export class AgentSessionWrapper {
     this.onDestroyCallback?.();
     this.resolveDisposed();
     invalidateSessionListCache();
+    resolve();
   }
 
   destroy(): void {
@@ -2034,9 +2026,9 @@ function registerRpcWrapper(wrapper: AgentSessionWrapper): void {
 /** In-process plugin API. Publish before any session loads its extensions. */
 export const externalSessionsBridge = {
   version: 1 as const,
-  register(options: ExternalSessionRegistration): { release(): void } {
+  register(options: ExternalSessionRegistration): { release(): Promise<void> } {
     const id = options.session?.sessionId;
-    if (!id || typeof options.isRunning !== "function") throw new Error("External session and isRunning are required");
+    if (!id) throw new Error("External session is required");
     if (getRegistry().has(id) || getLocks().has(id)) throw new Error(`Session already registered or starting: ${id}`);
     const wrapper = new AgentSessionWrapper(options.session, { external: options });
     try {

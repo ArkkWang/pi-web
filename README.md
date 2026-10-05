@@ -129,20 +129,29 @@ Pi agent extensions.
 
 [中文改动说明：问题、修改位置与边界](./README.zh-CN.md#本-fork-的改动接入扩展创建的子-agent)
 
-This fork exposes a small same-process plugin bridge so extensions can register an
-existing Pi SDK session with the Web UI. The UI reuses its existing wrapper, SDK
-events and sidebar refresh; the extension remains the execution/lifecycle owner.
-There is no per-stage reporting protocol. See [BRIDGE-CONTRACT.md](./BRIDGE-CONTRACT.md)
-for registration, ownership and v1 limitations.
+This fork exposes `register({ session }) -> { release() }` through the same-process
+`Symbol.for('@agegr/pi-web/external-sessions/v1')` bridge. Web operates the **same
+Pi SDK instance** directly, using normal SDK commands, events and sidebar refresh.
+There are no manager callbacks or stage synchronization. The registrant owns
+release/dispose: `await release()` drains Web-admitted work before detach, without
+cancelling it; only then may the owner dispose. Web does not rebind external
+extensions or MCP.
 
-The `home-pi-subagent` integration has been exercised with the real SDK and an
-isolated browser on Windows/Git Bash. The browser regression is
-`node e2e/external-sessions.mjs`; set `HOME_SCRIPTS_SUBAGENT` if the extension is not
-in a sibling `home-scripts` checkout, and optionally `E2E_CHROMIUM_PATH` to use an
-existing Chromium executable. Otherwise use Playwright's installed browser.
-This prototype is not a replacement for an already-running upstream instance.
-macOS/Linux have not been tested. Targeted bridge checks pass, but the complete
-upstream test suite has unresolved failures in this Windows environment.
+UI operations bypass the plugin dispatch tool's concurrency and foreground
+notification policy. State uses SDK flags/events and Web's own pending prompts;
+external preparation before SDK activity is **not fully observable**, and Stop
+retains SDK cancellation limits. Standalone UI bash is unsupported for registered
+external sessions (SDK idle/abort excludes its lifecycle); agent bash tool calls
+are unaffected. See [BRIDGE-CONTRACT.md](./BRIDGE-CONTRACT.md)
+for file/identity protections and lifecycle responsibilities.
+
+The callback-free contract needs coordinated `home-scripts` adapter and browser
+validation, maintained separately. `e2e/external-sessions.mjs` is the existing
+cross-repository browser harness (requires the adapted extension); prior browser
+results do not validate this revised contract. macOS/Linux have not been tested.
+The complete upstream test suite has unresolved Windows failures; use targeted
+checks for this change. This prototype does not replace an already-running
+upstream instance.
 
 ### Extension Session Liveness
 

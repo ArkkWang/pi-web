@@ -17,7 +17,7 @@ const artifacts = join(root, 'test-results/external-sessions'); mkdirSync(artifa
 const log = text => { console.log(text); appendFileSync(join(artifacts, 'result.log'), text + '\n'); };
 writeFileSync(join(artifacts, 'result.log'), '');
 const dir = mkdtempSync(join(tmpdir(), 'pi-external-e2e-')); const cwd = join(dir, 'project'); mkdirSync(cwd);
-let server, browser, page; const pending = []; let requests = 0;
+let server, browser, page; const pending = []; let requests = 0; let holdCompaction = false;
 const serverLog = createWriteStream(join(artifacts, 'server.log'));
 function reply(res, content, tool) {
   res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -31,7 +31,7 @@ const mock = createServer(async (req, res) => {
     const body = JSON.parse(raw); requests++;
     appendFileSync(join(artifacts, 'model.log'), JSON.stringify(body) + '\n');
     const last = body.messages.at(-1); const text = JSON.stringify(last?.content);
-    if (last?.role === 'user' && /EXTERNAL_CHILD_HOLD|SECOND_HOLD/.test(text)) { pending.push(res); return; }
+    if (holdCompaction || last?.role === 'user' && /EXTERNAL_CHILD_HOLD|SECOND_HOLD/.test(text)) { pending.push(res); return; }
     reply(res, 'E2E model completed', last?.role === 'user' && text.includes('START_EXTERNAL_CHILD'));
   } catch (e) { res.writeHead(500); res.end(String(e)); }
 });
@@ -39,7 +39,7 @@ async function until(fn, label, timeout = 60000) { const end = Date.now() + time
 try {
   mock.listen(0, '127.0.0.1'); await once(mock, 'listening');
   writeFileSync(join(dir, 'models.json'), JSON.stringify({ providers: { 'external-e2e': { baseUrl: `http://127.0.0.1:${mock.address().port}/v1`, api: 'openai-completions', apiKey: 'isolated-fake-key', models: [{ id: 'mock', name: 'E2E mock', reasoning: false, input: ['text'], contextWindow: 32768, maxTokens: 2048, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
-  writeFileSync(join(dir, 'settings.json'), JSON.stringify({ defaultProvider: 'external-e2e', defaultModel: 'mock', extensions: [extension], compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: 'off' }));
+  writeFileSync(join(dir, 'settings.json'), JSON.stringify({ defaultProvider: 'external-e2e', defaultModel: 'mock', extensions: [extension], compaction: { enabled: false, keepRecentTokens: 32 }, retry: { enabled: false }, cacheWarming: 'off' }));
   const probe = createServer(); probe.listen(0, '127.0.0.1'); await once(probe, 'listening'); const port = probe.address().port; await new Promise(r => probe.close(r));
   const base = `http://127.0.0.1:${port}`;
   server = spawn(process.execPath, [join(root, 'node_modules/next/dist/bin/next'), 'dev', '-H', '127.0.0.1', '-p', String(port)], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: dir, PI_WEB_PASSWORD: '', NEXT_TELEMETRY_DISABLED: '1', NODE_ENV: 'development' }, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -65,6 +65,9 @@ try {
   await row.click();
   await page.getByRole('button', { name: 'Stop', exact: true }).waitFor();
   log('PASS: selecting active external child shows Stop agent');
+  await api('/api/agent/' + child.id, { type: 'follow_up', message: 'UI_FOLLOWUP' });
+  assert.equal((await api('/api/sessions/' + child.id + '/state')).state.pendingMessageCount, 1);
+  log('PASS: WebUI follow-up is accepted directly by SDK');
   reply(pending.shift(), 'EXTERNAL_CHILD_FINISHED');
   await page.getByText('EXTERNAL_CHILD_FINISHED', { exact: true }).waitFor();
   await page.getByRole('button', { name: 'Stop', exact: true }).waitFor({ state: 'hidden' });
@@ -74,9 +77,27 @@ try {
   await until(() => pending.length === 1, 'resumed child model request');
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await page.getByRole('button', { name: 'Stop', exact: true }).waitFor({ state: 'hidden' });
-  log('PASS: idle child can resume through owner; browser Stop returns to idle');
+  log('PASS: idle child resumes directly through SDK; browser Stop returns to idle');
+  for (const response of pending.splice(0)) response.destroy();
+  // Keep a genuine older turn beyond keepRecentTokens; an aborted tiny session
+  // is legitimately refused by SDK compaction and cannot verify the UI state.
+  await api('/api/agent/' + child.id, { type: 'prompt', message: 'Compaction fixture history: ' + 'context-details '.repeat(256) });
+  await until(async () => !(await api('/api/agent/running')).runningSessionIds.includes(child.id), 'context preparation');
+  await api('/api/agent/' + child.id, { type: 'prompt', message: 'Keep a recent checkpoint.' });
+  await until(async () => !(await api('/api/agent/running')).runningSessionIds.includes(child.id), 'context checkpoint');
+  holdCompaction = true;
+  const compacting = api('/api/agent/' + child.id, { type: 'compact' });
+  // Observe rejection immediately if SDK refuses before reaching the model.
+  await Promise.race([until(() => pending.length === 1, 'compaction model request'), compacting.then(() => { throw Error('Compaction ended before observation'); })]);
+  assert.equal((await api('/api/sessions/' + child.id + '/state')).state.isCompacting, true);
+  await page.getByRole('button', { name: 'Stop compaction', exact: true }).waitFor();
+  holdCompaction = false;
+  reply(pending.shift(), 'E2E compacted context summary.');
+  await compacting;
+  await page.getByRole('button', { name: 'Stop compaction', exact: true }).waitFor({ state: 'hidden' });
+  assert.equal((await api('/api/sessions/' + child.id + '/state')).state.isCompacting, false);
+  log('PASS: live SDK compaction shows and clears the composer compaction state');
   assert.deepEqual(errors, [], 'browser runtime errors'); log('PASS: no browser runtime errors; mock requests=' + requests);
-  log('NOT TESTED: live compaction');
 } catch (e) {
   log(e.stack || String(e)); process.exitCode = 1;
   if (page) writeFileSync(join(artifacts, 'failure-dom.txt'), await page.locator('body').innerText().catch(() => 'Unavailable'));

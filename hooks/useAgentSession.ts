@@ -1345,8 +1345,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     };
   }, [agentRunning, opts.sessionRunning, reconcileAgentState]);
 
-  // The sidebar already polls owner-aware running snapshots. A selected idle
-  // child may start externally without an SDK agent_start during preparation.
+  // Reuse the sidebar SDK running snapshot to recover a missed start event
+  // for a selected session that was locally idle.
   useEffect(() => {
     const sid = sessionIdRef.current;
     if (sid && opts.sessionRunning !== undefined) void reconcileAgentState(sid);

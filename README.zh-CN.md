@@ -16,13 +16,17 @@
 
 **修改的位置**：
 - `lib/rpc-manager.ts`：开放同进程、带版本的插件注册接口，将**同一个 SDK 会话实例**接入现有 wrapper、注册表和 SSE；注册、首次落盘及解除关联时更新列表缓存版本，复用原有侧栏刷新。
-- `hooks/useAgentSession.ts`：接通已有运行状态快照与输入框状态查询，补上执行准备和收尾期间的同步。
+- `hooks/useAgentSession.ts`：复用已有 SDK 运行快照与状态查询，补偿遗漏的事件；不做 manager 阶段同步。
 - `app/api/sessions/[id]/`：增加所有权保护，避免 WebUI 删除、重命名或重写仍由插件持有的会话及其关联文件。
-- 配套单测和 `e2e/external-sessions.mjs`：验证实时状态、自动发现、续发、停止及资源释放边界。
+- 配套单测：覆盖无回调注册、SDK 直达发送/停止/压缩、状态事件、自动发现及释放。`e2e/external-sessions.mjs` 是待配合外部适配验证的跨仓库浏览器脚本。
 
-**不改变的部分**：WebUI 继续使用 SDK 原生事件展示输出、工具调用和压缩；插件继续负责调度、排队、停止和释放。没有逐阶段上报协议，也没有重写双方的执行逻辑。接口仅支持同进程接入，不能接管另一 Pi 进程中的任务。契约见 [BRIDGE-CONTRACT.md](./BRIDGE-CONTRACT.md)。
+**契约与边界**：`register({ session }) -> { release() }`，沿用 `Symbol.for('@agegr/pi-web/external-sessions/v1')`。WebUI 直接操作同一个 SDK 实例，不调用 manager 的 send/stop/isRunning 回调，不代理 SDK，不重新绑定外部扩展或 MCP。注册者拥有 release/dispose：必须 `await release()` 后才 dispose；release 拒绝新的 Web 执行请求，保留注册表占位并等待已受理 Web 操作收束，不等于取消，也不设超时。注册者仍需自行收束外部任务。保留文件与身份变更保护。UI 操作**不经过派发工具的并发限制或 foreground 通知策略**，外部 manager 如需感知，应观察 SDK 事件。
 
-当前为试验分支 `feat/external-session-bridge`：Windows/Git Bash 下相关回归和隔离浏览器验证通过，但完整测试集仍有未定位失败，macOS/Linux 尚未实测。下面的 `npx @agegr/pi-web@latest` 是**上游安装命令，不包含本 Fork 的改动**。
+状态来自 SDK 标志/事件与 Web 自己的 pending prompt。外部调用在 SDK 活动标志/事件出现前的准备阶段，以及 manager 独有收尾阶段，仍可能显示空闲；Stop 保留 SDK 原生准备阶段取消限制，不代表取消 manager 队列。外部会话暂不支持独立 UI bash 命令（SDK idle/abort 不涵盖该 shell 生命周期）；Agent 工具中的 bash 不受影响。不为此增加生命周期协议。没有新轮询或逐阶段协议。仅支持同进程。完整契约见 [BRIDGE-CONTRACT.md](./BRIDGE-CONTRACT.md)。
+
+当前为试验分支 `feat/external-session-bridge`：本次无回调契约的 home-scripts 适配、跨仓库与浏览器验证由外部协作完成，旧版浏览器通过记录不能代表本次验证。完整测试集仍有未定位的 Windows 失败，macOS/Linux 尚未实测。下面的 `npx @agegr/pi-web@latest` 是**上游安装命令，不包含本 Fork 的改动**。
+
+本次本机验证结果与工程复盘见 [外部 SDK 会话接入：验证与工程复盘](./docs/external-sdk-integration.md)。
 
 ## 功能
 
