@@ -10,6 +10,20 @@
 
 ![Pi Web 展示包含结构化 Markdown、工具调用和项目导航的 pi 会话](https://raw.githubusercontent.com/agegr/pi-web/main/docs/screenshot2.png)
 
+## 本 Fork 的改动：接入扩展创建的子 Agent
+
+**解决的问题**：我们的 Pi 扩展直接通过 SDK 创建子会话。上游 WebUI 能读取其 JSONL 历史，但这些实例未进入 WebUI 的会话管理器，导致子 Agent 实际运行或压缩时，输入框仍显示空闲；新子会话也不能及时出现在侧栏，之前需要油猴脚本定时强制刷新列表缓存。
+
+**修改的位置**：
+- `lib/rpc-manager.ts`：开放同进程、带版本的插件注册接口，将**同一个 SDK 会话实例**接入现有 wrapper、注册表和 SSE；注册、首次落盘及解除关联时更新列表缓存版本，复用原有侧栏刷新。
+- `hooks/useAgentSession.ts`：接通已有运行状态快照与输入框状态查询，补上执行准备和收尾期间的同步。
+- `app/api/sessions/[id]/`：增加所有权保护，避免 WebUI 删除、重命名或重写仍由插件持有的会话及其关联文件。
+- 配套单测和 `e2e/external-sessions.mjs`：验证实时状态、自动发现、续发、停止及资源释放边界。
+
+**不改变的部分**：WebUI 继续使用 SDK 原生事件展示输出、工具调用和压缩；插件继续负责调度、排队、停止和释放。没有逐阶段上报协议，也没有重写双方的执行逻辑。接口仅支持同进程接入，不能接管另一 Pi 进程中的任务。契约见 [BRIDGE-CONTRACT.md](./BRIDGE-CONTRACT.md)。
+
+当前为试验分支 `feat/external-session-bridge`：Windows/Git Bash 下相关回归和隔离浏览器验证通过，但完整测试集仍有未定位失败，macOS/Linux 尚未实测。下面的 `npx @agegr/pi-web@latest` 是**上游安装命令，不包含本 Fork 的改动**。
+
 ## 功能
 
 - **会话工作区**：按项目查找、继续、重命名、导出和删除对话，并查看运行状态、上下文占用、花费和压缩信息。

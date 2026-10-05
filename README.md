@@ -127,6 +127,8 @@ Pi agent extensions.
 
 ### External SDK sessions (experimental fork)
 
+[中文改动说明：问题、修改位置与边界](./README.zh-CN.md#本-fork-的改动接入扩展创建的子-agent)
+
 This fork exposes a small same-process plugin bridge so extensions can register an
 existing Pi SDK session with the Web UI. The UI reuses its existing wrapper, SDK
 events and sidebar refresh; the extension remains the execution/lifecycle owner.
