@@ -1664,11 +1664,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       }}
     >
       {/* Hidden file input */}
+      {/* NOTE: 不要加 `multiple`。Native Alpha 等 WebView 壳回传多选（ClipData）结果时会丢文件，
+          导致 change 事件根本不触发、页面静默无反应（单选通道正常）。 */}
       {!compact && <input
         ref={fileInputRef}
         type="file"
         accept="image/*"
-        multiple
         style={{ display: "none" }}
         onChange={(e) => {
           const files = Array.from(e.target.files ?? []);
