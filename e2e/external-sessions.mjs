@@ -42,9 +42,13 @@ try {
   writeFileSync(join(dir, 'settings.json'), JSON.stringify({ defaultProvider: 'external-e2e', defaultModel: 'mock', extensions: [extension], compaction: { enabled: false, keepRecentTokens: 32 }, retry: { enabled: false }, cacheWarming: 'off' }));
   const probe = createServer(); probe.listen(0, '127.0.0.1'); await once(probe, 'listening'); const port = probe.address().port; await new Promise(r => probe.close(r));
   const base = `http://127.0.0.1:${port}`;
-  server = spawn(process.execPath, [join(root, 'node_modules/next/dist/bin/next'), 'dev', '-H', '127.0.0.1', '-p', String(port)], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: dir, PI_WEB_PASSWORD: '', NEXT_TELEMETRY_DISABLED: '1', NODE_ENV: 'development' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const packageRoot = process.env.PI_WEB_PACKAGE_ROOT;
+  const args = packageRoot
+    ? [join(packageRoot, 'bin/pi-web.js'), '--no-open', '--hostname', '127.0.0.1', '--port', String(port)]
+    : [join(root, 'node_modules/next/dist/bin/next'), 'dev', '-H', '127.0.0.1', '-p', String(port)];
+  server = spawn(process.execPath, args, { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: dir, PI_WEB_PASSWORD: '', NEXT_TELEMETRY_DISABLED: '1', NODE_ENV: packageRoot ? 'production' : 'development' }, stdio: ['ignore', 'pipe', 'pipe'] });
   server.stdout.pipe(serverLog, { end: false }); server.stderr.pipe(serverLog, { end: false });
-  log(`Isolated dev PID=${server.pid} port=${port}; mock port=${mock.address().port}`);
+  log(`Isolated ${packageRoot ? 'release' : 'dev'} PID=${server.pid} port=${port}; mock port=${mock.address().port}`);
   async function api(path, body) { const r = await fetch(base + path, { ...(body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(60000) }); const data = await r.json(); assert(r.ok, JSON.stringify(data)); return data; }
   await until(async () => { try { return (await fetch(base + '/api/sessions')).ok; } catch { return false; } }, 'dev readiness', 120000);
   const parent = await api('/api/agent/new', { type: 'prompt', cwd, message: 'SEED_PARENT', provider: 'external-e2e', modelId: 'mock' });

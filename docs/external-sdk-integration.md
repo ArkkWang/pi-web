@@ -74,3 +74,17 @@ Windows 下全量测试存在路径、权限和清理失败。没有基线时，
 在共享 SDK 的责任边界尚未固定时，同时修改两边、测试和文档，导致三回调方案和后续调整都有返工。
 
 **以后采用**：先以最小真实 SDK 实验确定契约，再按文件边界并行；接口变化时统一同步、冻结源码后验收。事先约定停止条件：目标链路和必要安全边界通过后，对基线同样失败的问题记录限制，不继续扩大修复。本次收口偏慢，后期有不断补边界、扩大验证的倾向，应以完成依据控制范围，而非追求把整个上游测试集修绿。保留隔离环境、不触碰正式服务是本次有效做法，应继续保持。
+
+## 本机发布
+
+Fork 版本 **0.10.0-home.1** 通过 `npm run build`、`npm pack` 构建，发布为 GitHub Release `v0.10.0-home.1` 的 tgz 附件，不发布到上游 npm 命名空间。已对 **npm 安装后的生产包**重复执行上述隔离 Chromium 全链路验证，全部通过；可通过 `PI_WEB_PACKAGE_ROOT=<已安装的包目录>` 复现。
+
+本机 `piweb` 仍使用 Tide + npx，但固定到以下包，并设置 `PI_WEB_SKIP_VERSION_CHECK=1`，避免提示更新回上游版本：
+
+```text
+https://github.com/ArkkWang/pi-web/releases/download/v0.10.0-home.1/agegr-pi-web-0.10.0-home.1.tgz
+```
+
+启动 alias 和插件统一经 home-scripts 的 `install.sh --profile=win11 ~/.bashrc ~/.bash_profile` 发布。不依赖开发目录，也不新增自制部署脚本。macOS 同样使用固定包 URL，通过自身 profile 的现有安装流程部署，但本次未实测。
+
+回退方式：将 `.urc` 的 `piweb` 包地址恢复为 `@agegr/pi-web@0.10.0`，移除 `PI_WEB_SKIP_VERSION_CHECK=1`，再走同一安装入口并重启 WebUI。无需迁移或删除已有会话。
