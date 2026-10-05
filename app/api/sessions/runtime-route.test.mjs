@@ -357,3 +357,43 @@ test("session detail returns a gzip-compressed response when the client accepts 
   const payload = JSON.parse(gunzipSync(Buffer.from(await response.arrayBuffer())).toString("utf8"));
   assert.equal(payload.info.firstMessage, firstMessage);
 });
+
+test("deleting a parent refuses to rewrite a registered external fork-shaped child", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-web-external-parent-delete-"));
+  const previousRegistry = globalThis.__piSessions;
+  const parentId = "external-parent-delete";
+  const childId = "external-fork-child";
+  const parentPath = join(dir, "parent.jsonl");
+  const childPath = join(dir, "child.jsonl");
+  const header = (id, parentSession) => ({
+    type: "session", version: 3, id, cwd: dir,
+    timestamp: "2026-01-01T00:00:00.000Z", ...(parentSession ? { parentSession } : {}),
+  });
+  const parentBytes = `${JSON.stringify(header(parentId))}\n`;
+  const childHeader = header(childId, parentPath);
+  const childBytes = `${JSON.stringify(childHeader)}\n`;
+  await writeFile(parentPath, parentBytes);
+  await writeFile(childPath, childBytes);
+  cacheSessionPath(parentId, parentPath);
+  // Deliberately absent from the runtime catalogue: protection must inspect
+  // every registration's live header, not only listed subagent relations.
+  globalThis.__piSessions = new Map([[childId, {
+    isAlive: () => false,
+    isExternallyOwned: () => true,
+    inner: { sessionManager: { getHeader: () => childHeader } },
+  }]]);
+  t.after(async () => {
+    globalThis.__piSessions = previousRegistry;
+    invalidateSessionPathCache(parentId);
+    invalidateSessionListCache();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const response = await deleteSession(
+    new Request(`http://localhost/api/sessions/${parentId}`, { method: "DELETE" }),
+    { params: Promise.resolve({ id: parentId }) },
+  );
+  assert.equal(response.status, 409);
+  assert.equal(await readFile(parentPath, "utf8"), parentBytes);
+  assert.equal(await readFile(childPath, "utf8"), childBytes);
+  assert.equal(globalThis.__piSessions.has(childId), true);
+});

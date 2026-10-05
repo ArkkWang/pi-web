@@ -1278,7 +1278,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // If the server reports idle while we still think it's running, finish
   // through the same settlement path used by non-streaming prompts.
   const reconcileAgentState = useCallback(async (sid: string) => {
-    if (!agentRunningRef.current || sessionIdRef.current !== sid) return;
+    if (sessionIdRef.current !== sid) return;
     const runId = promptRunIdRef.current;
     try {
       const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
@@ -1299,6 +1299,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const busy = data.running && state
         && (state.isStreaming || state.isPromptRunning || state.isCompacting);
       if (busy) {
+        if (!agentRunningRef.current) {
+          agentRunningRef.current = true;
+          setAgentRunning(true);
+          setAgentPhase(state.isStreaming ? { kind: "waiting_model" } : { kind: "running_command" });
+        }
         sdkAgentActiveRef.current = Boolean(state.isStreaming);
         rpcPromptPendingRef.current = Boolean(state.isPromptRunning);
         return;
@@ -1320,7 +1325,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // against the server periodically and whenever the tab returns to the
   // foreground or the network comes back.
   useEffect(() => {
-    if (!agentRunning) return;
+    if (!agentRunning && !opts.sessionRunning) return;
     const reconcile = () => {
       // Read the ref on every tick: for brand-new sessions the id is
       // assigned only after ensure_session returns.
@@ -1338,7 +1343,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("online", reconcile);
     };
-  }, [agentRunning, reconcileAgentState]);
+  }, [agentRunning, opts.sessionRunning, reconcileAgentState]);
+
+  // The sidebar already polls owner-aware running snapshots. A selected idle
+  // child may start externally without an SDK agent_start during preparation.
+  useEffect(() => {
+    const sid = sessionIdRef.current;
+    if (sid && opts.sessionRunning !== undefined) void reconcileAgentState(sid);
+  }, [opts.sessionRunning, reconcileAgentState]);
 
   useEffect(() => {
     agentRunningRef.current = agentRunning;

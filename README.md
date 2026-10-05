@@ -125,6 +125,23 @@ list. If no listener cancels the extension event, Pi Web preserves the
 browser's native context menu. This hook is browser-side and independent of
 Pi agent extensions.
 
+### External SDK sessions (experimental fork)
+
+This fork exposes a small same-process plugin bridge so extensions can register an
+existing Pi SDK session with the Web UI. The UI reuses its existing wrapper, SDK
+events and sidebar refresh; the extension remains the execution/lifecycle owner.
+There is no per-stage reporting protocol. See [BRIDGE-CONTRACT.md](./BRIDGE-CONTRACT.md)
+for registration, ownership and v1 limitations.
+
+The `home-pi-subagent` integration has been exercised with the real SDK and an
+isolated browser on Windows/Git Bash. The browser regression is
+`node e2e/external-sessions.mjs`; set `HOME_SCRIPTS_SUBAGENT` if the extension is not
+in a sibling `home-scripts` checkout, and optionally `E2E_CHROMIUM_PATH` to use an
+existing Chromium executable. Otherwise use Playwright's installed browser.
+This prototype is not a replacement for an already-running upstream instance.
+macOS/Linux have not been tested. Targeted bridge checks pass, but the complete
+upstream test suite has unresolved failures in this Windows environment.
+
 ### Extension Session Liveness
 
 Server-side Pi extensions with detached work can prevent automatic idle

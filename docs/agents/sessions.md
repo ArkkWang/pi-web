@@ -53,3 +53,10 @@ On mount `useAgentSession` loads the history, then `GET /api/sessions/[id]/state
 
 ## Exported session HTML
 - `/api/sessions/[id]/export` delegates to pi's export helper, then makes the generated HTML's recursive tree helpers iterative, so very deep linear sessions do not overflow the browser call stack.
+
+## External plugin-owned sessions (bridge v1)
+- `globalThis[Symbol.for('@agegr/pi-web/external-sessions/v1')]` exposes `register({ session, isRunning, send?, stop? }) -> { release() }`; see `BRIDGE-CONTRACT.md`. Installed by rpc-manager before loading session extensions. Duplicate ids/start locks reject; no silent replacement.
+- External wrappers reuse registry, live history and SSE, but never bind extensions, load MCP, arm idle timers, evict from disk changes, abort or dispose the owner's SDK. `isRunning()` combines manager logical activity with SDK streaming/compaction; Stop acceptance does not imply idle.
+- Only read queries and explicitly provided message/Stop callbacks are allowed. Tool changes, rename, auto-name and deletion of registered external sessions (including cascade deletion) refuse. `shutdown()` refuses and `destroy()` leaves external ownership intact; only the registration's `release()` detaches. Release must follow owner completion and relinquishment; Web can reopen the persisted file afterward.
+- Register/release invalidate the existing session-list version. First `message_end` with an existing file invalidates once more (SDK initially buffers before flushing); existing `agent_end` invalidation remains. Sidebar's existing running poll observes `sessionListVersion` and reloads the list; no new full-scan polling.
+- The hook consumes the existing `sessionRunning` sidebar snapshot to reconcile a selected child that starts while locally idle (including SDK preparation). No new timer/protocol: the existing state poll runs while either local state or the snapshot is busy. External SDK `agent_settled` is withheld while its manager still reports busy; snapshot changes trigger the same reconciliation at owner completion. Normal session SSE settlement is unchanged.

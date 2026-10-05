@@ -17,6 +17,7 @@ export async function POST(
     }
 
     const existing = getRpcSession(id);
+    if (existing?.isExternallyOwned?.()) throw new Error("External session is managed by its owner");
     const { session } = existing?.isAlive()
       ? { session: existing }
       : await startRpcSession(id, filePath, undefined);

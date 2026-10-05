@@ -1,3 +1,4 @@
+import { sessionPathKey } from "./session-path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
@@ -116,7 +117,24 @@ type ExtensionCommandContextActionsLike = {
   reload: () => Promise<void>;
 };
 
+export interface ExternalSessionRegistration {
+  session: AgentSessionLike;
+  isRunning: () => boolean;
+  send?: (command: {
+    type: "prompt" | "steer" | "follow_up";
+    message: string;
+    images?: Array<{ type: "image"; data: string; mimeType: string }>;
+    streamingBehavior?: "steer" | "followUp";
+  }) => unknown | Promise<unknown>;
+  stop?: () => unknown | Promise<unknown>;
+}
+
+const EXTERNAL_READ_COMMANDS = new Set([
+  "get_state", "get_tools", "get_commands", "get_session_stats", "get_last_assistant_text",
+]);
+
 type AgentSessionWrapperOptions = {
+  external?: ExternalSessionRegistration;
   exactSystemPrompt?: () => string;
   chatOnly?: boolean;
   onAgentRunComplete?: AgentRunCompleteListener;
@@ -297,6 +315,8 @@ export class AgentSessionWrapper {
   private extensionBindingPromise: Promise<void> | null = null;
   private extensionBindingError: unknown = null;
   private readonly exactSystemPrompt?: () => string;
+  private externalFileDiscovered = false;
+  private readonly external?: ExternalSessionRegistration;
   private readonly chatOnly: boolean;
   private readonly onAgentRunComplete?: AgentRunCompleteListener;
   private readonly suppressCompletionNotifications: boolean;
@@ -323,6 +343,7 @@ export class AgentSessionWrapper {
     public readonly inner: AgentSessionLike,
     options: AgentSessionWrapperOptions = {},
   ) {
+    this.external = options.external;
     this.exactSystemPrompt = options.exactSystemPrompt;
     this.chatOnly = options.chatOnly ?? false;
     this.onAgentRunComplete = options.onAgentRunComplete;
@@ -359,8 +380,10 @@ export class AgentSessionWrapper {
     return this._alive && !this.closing;
   }
 
+  isExternallyOwned(): boolean { return Boolean(this.external); }
+
   isRunning(): boolean {
-    return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
+    return this._alive && (this.external?.isRunning() || this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
   }
 
   /**
@@ -369,7 +392,7 @@ export class AgentSessionWrapper {
    * prompt that started during the probe cannot be disposed.
    */
   evictIfDiskAhead(): boolean {
-    if (!this.isAlive() || this.isRunning()) return false;
+    if (this.external || !this.isAlive() || this.isRunning()) return false;
     const diskLatestId = readLatestSessionEntryId(this.sessionFile);
     if (!diskLatestId || this.inner.sessionManager.getEntry(diskLatestId)) return false;
     if (this.isRunning()) return false;
@@ -388,6 +411,12 @@ export class AgentSessionWrapper {
 
   start(): void {
     this.unsubscribe = this.inner.subscribe((event: AgentEvent) => {
+      // The first persisted message makes a newly registered child discoverable.
+      if (this.external && !this.externalFileDiscovered && event.type === "message_end"
+        && this.sessionFile && existsSync(this.sessionFile)) {
+        this.externalFileDiscovered = true;
+        invalidateSessionListCache();
+      }
       if (event.type === "agent_start") this.agentRunNeedsCompletion = true;
       if (event.type === "agent_end") {
         invalidateSessionListCache();
@@ -396,6 +425,9 @@ export class AgentSessionWrapper {
       }
       this.trackActiveToolEvent(event);
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
+      // SDK settlement can precede the owner's final bookkeeping. The existing
+      // state reconciliation/running snapshot observes that logical completion.
+      if (event.type === "agent_settled" && this.external?.isRunning()) return;
       this.emit(event);
       if (event.type === "agent_settled") this.notifyAgentRunCompleteIfIdle();
     });
@@ -445,7 +477,7 @@ export class AgentSessionWrapper {
   }
 
   private ensureExtensionsBound(): Promise<void> {
-    if (this.extensionsBound) return Promise.resolve();
+    if (this.external || this.extensionsBound) return Promise.resolve();
     if (this.extensionBindingPromise) return this.extensionBindingPromise;
 
     this.extensionBindingError = null;
@@ -535,6 +567,7 @@ export class AgentSessionWrapper {
 
   /** Apply a coding tool selection; `carry` defaults to the tools active now. */
   setActiveToolSelection(toolNames: string[], carry: readonly string[] = this.inner.getActiveToolNames()): void {
+    if (this.external) throw new Error("External session tools are owned by its manager");
     this.inner.setActiveToolsByName(resolveActiveToolNames(this.inner, toolNames, carry));
   }
 
@@ -587,6 +620,7 @@ export class AgentSessionWrapper {
   }
 
   private resetIdleTimer(): void {
+    if (this.external) return;
     if (!this._alive) {
       if (this.idleTimer) clearTimeout(this.idleTimer);
       return;
@@ -696,7 +730,29 @@ export class AgentSessionWrapper {
   }
 
   async send(command: Record<string, unknown>): Promise<unknown> {
+    if (!this.isAlive()) throw new Error("Session is closed");
     const type = command.type as string;
+    if (this.external && !EXTERNAL_READ_COMMANDS.has(type)) {
+      if (type === "abort" || type === "abort_compaction" || type === "abort_bash") {
+        if (!this.external.stop) throw new Error("External session does not support Stop");
+        return await this.external.stop();
+      }
+      if (type === "prompt" || type === "steer" || type === "follow_up") {
+        if (!this.external.send) throw new Error("External session does not support sending messages");
+        if (typeof command.message !== "string") throw new Error("message must be a string");
+        const imageError = validateAgentImages(command.images);
+        if (imageError) throw new Error(imageError);
+        if (command.streamingBehavior !== undefined && command.streamingBehavior !== "steer" && command.streamingBehavior !== "followUp") {
+          throw new Error("Invalid streamingBehavior");
+        }
+        return await this.external.send({
+          type, message: command.message,
+          images: command.images as Parameters<NonNullable<ExternalSessionRegistration["send"]>>[0]["images"],
+          streamingBehavior: command.streamingBehavior as "steer" | "followUp" | undefined,
+        });
+      }
+      throw new Error(`External session command is managed by its owner: ${type}`);
+    }
     const allowedDuringReplacement = COMMANDS_ALLOWED_DURING_SESSION_REPLACEMENT.has(type);
     if (this.sessionReplacement && !allowedDuringReplacement) {
       throw new Error("Session is being copied to a new session");
@@ -870,7 +926,7 @@ export class AgentSessionWrapper {
           sessionId: this.inner.sessionId,
           sessionFile: this.inner.sessionFile ?? "",
           isStreaming: this.inner.isStreaming,
-          isPromptRunning: this.pendingPromptCount > 0,
+          isPromptRunning: Boolean(this.external?.isRunning()) || this.pendingPromptCount > 0,
           isBashRunning: this.inner.isBashRunning,
           isCompacting: this.inner.isCompacting,
           autoCompactionEnabled: this.inner.autoCompactionEnabled,
@@ -1186,7 +1242,7 @@ export class AgentSessionWrapper {
       }
 
       case "bash": {
-        if (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning) {
+        if (this.external?.isRunning() || this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning) {
           throw new Error("Cannot run a shell command while the session is busy");
         }
         const execution = this.inner.executeBash(
@@ -1239,8 +1295,22 @@ export class AgentSessionWrapper {
     }
   }
 
+  /** Only the registration owner may detach an externally owned session. */
+  releaseExternal(): void {
+    if (!this.external || !this._alive) return;
+    this._alive = false;
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.emit({ type: "session_shutdown" });
+    this.listeners.clear();
+    this.activeToolEvents.clear();
+    this.onDestroyCallback?.();
+    this.resolveDisposed();
+    invalidateSessionListCache();
+  }
+
   destroy(): void {
-    if (!this._alive) return;
+    if (this.external || !this._alive) return;
     this._alive = false;
     this.disposeMcpHost();
     // Tell attached SSE listeners to drop this instance so the browser
@@ -1291,6 +1361,7 @@ export class AgentSessionWrapper {
   }
 
   async shutdown(): Promise<void> {
+    if (this.external) throw new Error("External session must be released by its owner");
     if (this.shutdownPromise) return this.shutdownPromise;
     if (!this._alive) return;
     // Closing starts before the first await, so a request that arrives while
@@ -1957,8 +2028,28 @@ function registerRpcWrapper(wrapper: AgentSessionWrapper): void {
   }
   registry.set(sessionId, wrapper);
   wrapper.start();
-  if (!wrapper.isChatOnly()) wrapper.beginExtensionBinding();
+  if (!wrapper.isChatOnly() && !wrapper.isExternallyOwned()) wrapper.beginExtensionBinding();
 }
+
+/** In-process plugin API. Publish before any session loads its extensions. */
+export const externalSessionsBridge = {
+  version: 1 as const,
+  register(options: ExternalSessionRegistration): { release(): void } {
+    const id = options.session?.sessionId;
+    if (!id || typeof options.isRunning !== "function") throw new Error("External session and isRunning are required");
+    if (getRegistry().has(id) || getLocks().has(id)) throw new Error(`Session already registered or starting: ${id}`);
+    const wrapper = new AgentSessionWrapper(options.session, { external: options });
+    try {
+      registerRpcWrapper(wrapper);
+    } catch (error) {
+      wrapper.releaseExternal();
+      throw error;
+    }
+    invalidateSessionListCache();
+    return { release: () => wrapper.releaseExternal() };
+  },
+};
+Reflect.set(globalThis, Symbol.for("@agegr/pi-web/external-sessions/v1"), externalSessionsBridge);
 
 const SUBAGENT_CONTROLLER = createSubagentController({
   getSession: (sessionId) => getRegistry().get(sessionId),
@@ -2052,6 +2143,18 @@ function trackStartingSession(cwd: string): () => void {
   };
 }
 
+/** A fork-shaped external child still owns its file: deleting its parent must
+ * not reparent/rewrite it through a second SessionManager or raw file write. */
+export function hasExternalRpcSessionParent(parentPaths: Iterable<string>): boolean {
+  const parents = new Set([...parentPaths].map((path) => sessionPathKey(path)));
+  for (const wrapper of getRegistry().values()) {
+    if (!wrapper.isExternallyOwned?.()) continue;
+    const parent = wrapper.inner.sessionManager.getHeader()?.parentSession;
+    if (parent && parents.has(sessionPathKey(parent))) return true;
+  }
+  return false;
+}
+
 export function getRpcSession(sessionId: string): AgentSessionWrapper | undefined {
   return getRegistry().get(sessionId);
 }
@@ -2077,6 +2180,7 @@ export async function setRpcSessionTools(
     ? undefined
     : validateSessionToolSelection(requestedToolNames);
   const existing = getRpcSession(sessionId);
+  if (existing?.isExternallyOwned()) throw new Error("External session tools are owned by its manager");
 
   if (!existing?.isAlive()) {
     if (!sessionFile) throw new Error("Session not found");

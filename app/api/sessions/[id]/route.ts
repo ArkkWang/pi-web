@@ -15,7 +15,7 @@ import {
   readSessionHeader,
 } from "@/lib/session-reader";
 import { sessionPathKey } from "@/lib/session-path";
-import { abortSubagent, getRpcSession, getRpcSessionInfos } from "@/lib/rpc-manager";
+import { abortSubagent, getRpcSession, getRpcSessionInfos, hasExternalRpcSessionParent } from "@/lib/rpc-manager";
 import { projectTreeForResponse, toSummaryTree } from "@/lib/project-tree";
 import { computeSessionTotalActiveMs } from "@/lib/session-timing";
 import { computeSessionStats } from "@/lib/session-stats";
@@ -176,6 +176,9 @@ export async function PATCH(
 ) {
   const { id } = await params;
   try {
+    if (getRpcSession(id)?.isExternallyOwned?.()) {
+      return NextResponse.json({ error: "External session is managed by its owner" }, { status: 409 });
+    }
     const { name } = await req.json() as { name?: string };
     if (typeof name !== "string") {
       return NextResponse.json({ error: "name is required" }, { status: 400 });
@@ -285,6 +288,11 @@ export async function DELETE(
         const resolvedPath = await resolveSessionPath(deletedId);
         if (resolvedPath) deletedPaths.set(deletedId, resolvedPath);
       }
+    }
+    // Refuse before any cascade reparenting or file deletion.
+    if ([...deletedSessionIds].some((sessionId) => getRpcSession(sessionId)?.isExternallyOwned?.())
+      || hasExternalRpcSessionParent(deletedPaths.values())) {
+      return NextResponse.json({ error: "External sessions must be released by their owner before deletion" }, { status: 409 });
     }
     const deletedPathKeys = new Set([...deletedPaths.values()].map((path) => sessionPathKey(path)));
 
