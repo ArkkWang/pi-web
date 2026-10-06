@@ -22,6 +22,7 @@ import { useI18n } from "@/hooks/useI18n";
 import { useIsMobile, useIsNarrowMobile } from "@/hooks/useIsMobile";
 import { useViewportHeight } from "@/hooks/useViewportHeight";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
+import { useSidebarSwipe } from "@/hooks/useSidebarSwipe";
 import { useAudio } from "@/hooks/useAudio";
 import { copyText } from "@/lib/clipboard";
 import { sendAgentCommand } from "@/lib/agent-client";
@@ -186,6 +187,10 @@ export function AppShell() {
   }, [rightPanelOpen, isMobile]);
   const [mobileToolbarMoreOpen, setMobileToolbarMoreOpen] = useState(false);
   const [mobileSidebarReady, setMobileSidebarReady] = useState(false);
+  // Gesture and overlay targets: the shell element bounds where a drawer swipe
+  // may start, the backdrop fades with the dragged drawer.
+  const shellRef = useRef<HTMLDivElement>(null);
+  const sidebarBackdropRef = useRef<HTMLDivElement>(null);
   const sidebarWidthRef = useRef(SIDEBAR_DEFAULT_WIDTH);
   const rightPanelWidthRef = useRef(RIGHT_PANEL_FALLBACK_WIDTH);
   const getResponsiveRightPanelWidth = useCallback(
@@ -389,13 +394,34 @@ export function AppShell() {
     setSettingsSection(section);
   }, []);
 
-  const handleSidebarToggle = useCallback(() => {
+  const openSidebar = useCallback(() => {
     if (isMobile) {
       setActiveTopPanel(null);
       setMobileToolbarMoreOpen(false);
     }
-    setSidebarOpen((open) => !open);
+    setSidebarOpen(true);
   }, [isMobile]);
+
+  const closeSidebar = useCallback(() => {
+    setSidebarOpen(false);
+  }, []);
+
+  const handleSidebarToggle = useCallback(() => {
+    if (sidebarOpen) closeSidebar();
+    else openSidebar();
+  }, [closeSidebar, openSidebar, sidebarOpen]);
+
+  // Swipe the mobile drawer in from the left edge and out again. The file panel
+  // covers the phone screen, so the gesture stays off while it is open.
+  useSidebarSwipe({
+    enabled: isMobile && !rightPanelOpen,
+    open: sidebarOpen,
+    containerRef: shellRef,
+    sidebarRef: sidebarResizer.panelRef,
+    backdropRef: sidebarBackdropRef,
+    onOpen: openSidebar,
+    onClose: closeSidebar,
+  });
 
   const handleMobileToolbarMoreToggle = useCallback(() => {
     setSidebarOpen(false);
@@ -1908,27 +1934,29 @@ export function AppShell() {
         }
       }
     `}</style>
-    <div style={{
-      display: "flex",
-      width: "100%",
-      height: "var(--app-viewport-height, 100dvh)",
-      paddingLeft: "env(safe-area-inset-left)",
-      paddingRight: "env(safe-area-inset-right)",
-      overflow: "hidden",
-      background: "var(--bg)",
-    }}>
-      {/* Mobile overlay backdrop */}
+    <div
+      ref={shellRef}
+      style={{
+        display: "flex",
+        width: "100%",
+        height: "var(--app-viewport-height, 100dvh)",
+        paddingLeft: "env(safe-area-inset-left)",
+        paddingRight: "env(safe-area-inset-right)",
+        overflow: "hidden",
+        background: "var(--bg)",
+      }}
+    >
+      {/* Mobile overlay backdrop. Its open state is a class so a drawer drag can
+          fade it in place (see app/globals.css). */}
       <div
-        className={`sidebar-overlay-backdrop${mobileSidebarReady ? "" : " sidebar-mobile-pending"}`}
-        onClick={() => setSidebarOpen(false)}
+        ref={sidebarBackdropRef}
+        className={`sidebar-overlay-backdrop${sidebarOpen ? " is-open" : ""}${mobileSidebarReady ? "" : " sidebar-mobile-pending"}`}
+        onClick={closeSidebar}
         style={{
           position: "fixed",
           inset: 0,
           zIndex: 199,
           background: "rgba(0,0,0,0.4)",
-          opacity: sidebarOpen ? 1 : 0,
-          pointerEvents: sidebarOpen ? "auto" : "none",
-          transition: "opacity 0.25s ease",
         }}
       />
 

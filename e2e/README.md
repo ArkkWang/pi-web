@@ -32,6 +32,12 @@ Coverage:
 - Chat width and font size persist, existing drafts resize, and short settings
   panels keep every language option reachable on desktop and mobile.
 - Unknown sessions and paths outside the fixture project are rejected.
+- A touch-capable mobile viewport drags the sidebar drawer: it follows the
+  finger, opens past the threshold, springs back below it, and only starts from
+  the left half of the screen. Each gesture a content element keeps instead
+  (a sideways pan, a caret drag in a field, an active selection, a long press)
+  is checked together with the same drag once that element is gone, so a pass
+  cannot come from a drag that never reached the gesture.
 - A local extension checks dialog keyboard navigation, Esc cancellation,
   collapse/expand draft preservation, countdown display, and server-side expiry.
 

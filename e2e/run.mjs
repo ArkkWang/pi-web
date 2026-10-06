@@ -12,6 +12,7 @@ import { chromium } from "playwright";
 import { checkFilePanel, filePanelFixture } from "./file-panel.mjs";
 import { checkExtensionDialogs, extensionSource } from "./extension-dialog.mjs";
 import { checkChatAppearance } from "./chat-appearance.mjs";
+import { checkMobileDrawer } from "./mobile-drawer.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const mode = process.env.E2E_SERVER_MODE || "dev";
@@ -412,6 +413,9 @@ try {
     context = undefined;
     page = undefined;
   }
+  // Needs its own touch-capable mobile context, so it runs outside the loop.
+  await checkMobileDrawer({ browser, base, artifacts });
+  console.log("PASS: mobile drawer swipe (follow, threshold, band, scroll, backdrop, toolbar)");
 } catch (error) {
   console.error(error);
   process.exitCode = 1;
