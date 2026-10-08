@@ -1,34 +1,53 @@
-import { statSync, watch, type FSWatcher } from "node:fs";
-import { resolve } from "node:path";
+import { readdirSync, statSync, watch, type FSWatcher } from "node:fs";
+import { readdir } from "node:fs/promises";
+import { join, resolve } from "node:path";
 
 type WatchOptions = {
   debounceMs?: number;
   retryMs?: number;
   fallbackMs?: number;
   watchDirectory?: (root: string, listener: (event: string, filename: string | Buffer | null) => void) => FSWatcher;
+  readDirectory?: (path: string) => Promise<string[]>;
   warn?: (error: unknown) => void;
 };
 
-/** Discover session files only. Never read transcripts or observe message appends. */
+function missing(error: unknown): boolean {
+  return ["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException)?.code ?? "");
+}
+function jsonlNames(names: string[]): Set<string> {
+  return new Set(names.filter(name => name.endsWith(".jsonl")));
+}
+function sameNames(a: Set<string> | undefined, b: Set<string>): boolean {
+  return (a?.size ?? 0) === b.size && [...b].every(name => a?.has(name));
+}
+
+/** Discover catalogue membership, never read transcript contents. */
 export function createSessionListWatcher(root: string, invalidate: () => void, options: WatchOptions = {}) {
   const debounceMs = options.debounceMs ?? 250;
   const fallbackMs = options.fallbackMs ?? 30_000;
+  const readDirectory = options.readDirectory ?? (path => readdir(path));
   const watchDirectory = options.watchDirectory ?? ((path, listener) =>
     watch(path, { recursive: true, persistent: false }, listener));
   let watcher: FSWatcher | undefined;
   let identity: string | undefined;
+  let inventory = new Map<string, Set<string>>();
+  const dirty = new Set<string>();
+  let full = false;
+  let force = false;
+  let scanning = false;
   let pending: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
   let warned = false;
   let lastFallback = Date.now();
 
-  const changed = () => {
-    // Coalesce a creation burst without indefinitely postponing discovery.
-    if (stopped || pending) return;
-    pending = setTimeout(() => {
-      pending = undefined;
-      invalidate();
-    }, debounceMs);
+  const readNames = async (path: string) => {
+    try { return await readDirectory(path); }
+    catch (error) { if (missing(error)) return []; throw error; }
+  };
+  const schedule = () => {
+    // Fixed window, not a trailing debounce: continuous writes cannot starve discovery.
+    if (stopped || pending || scanning) return;
+    pending = setTimeout(() => { pending = undefined; void reconcile(); }, debounceMs);
     pending.unref?.();
   };
   const detach = () => {
@@ -45,6 +64,39 @@ export function createSessionListWatcher(root: string, invalidate: () => void, o
       else console.warn("[pi-web] session directory watch unavailable; retrying with periodic list invalidation", error);
     }
   };
+  const reconcile = async () => {
+    scanning = true;
+    const current = watcher;
+    const checkAll = full;
+    const mustInvalidate = force;
+    const projects = [...dirty];
+    full = force = false;
+    dirty.clear();
+    try {
+      const next = checkAll ? new Map<string, Set<string>>() : new Map(inventory);
+      for (const project of checkAll ? await readNames(root) : projects) {
+        const names = jsonlNames(await readNames(join(root, project)));
+        if (names.size) next.set(project, names);
+        else next.delete(project);
+      }
+      // A closed/replaced watch owns a different baseline. Discard stale IO.
+      if (stopped || watcher !== current) return;
+      const changed = next.size !== inventory.size
+        || [...next].some(([project, names]) => !sameNames(inventory.get(project), names));
+      inventory = next;
+      if (changed || mustInvalidate) invalidate();
+    } catch (error) {
+      if (!stopped && watcher === current) {
+        // Never install a partial snapshot on permission/IO errors.
+        failed(error);
+        invalidate();
+      }
+    } finally {
+      scanning = false;
+      if (dirty.size || full || force) schedule();
+    }
+  };
+  const changed = () => { force = true; full = true; schedule(); };
   const attach = () => {
     if (stopped) return;
     try {
@@ -53,19 +105,34 @@ export function createSessionListWatcher(root: string, invalidate: () => void, o
       const nextIdentity = `${stats.dev}:${stats.ino}`;
       if (watcher && identity === nextIdentity) return;
       detach();
-      const next = watchDirectory(root, (event, filename) => {
-        // fs.watch reports create/delete/rename as "rename". Existing message
-        // appends are "change" and must not keep invalidating catalogue scans.
-        if (event !== "rename") return;
-        if (filename == null) { changed(); return; }
-        // Match the SDK catalogue: sessions/<cwd>/*.jsonl, not arbitrary depths.
-        const parts = filename.toString().replaceAll("\\", "/").split("/");
-        if (parts.length === 1 || (parts.length === 2 && parts[1].endsWith(".jsonl"))) changed();
+      const next = watchDirectory(root, (_event, filename) => {
+        if (stopped || watcher !== next) return;
+        // Neither "rename" nor "change" proves membership changed. In particular,
+        // macOS recursive watches may report every append as "rename".
+        if (filename == null) full = true;
+        else {
+          const parts = filename.toString().replaceAll("\\", "/").split("/");
+          if (parts.some(part => !part || part === "." || part === "..")) full = true;
+          else if (parts.length === 1 || (parts.length === 2 && parts[1].endsWith(".jsonl"))) dirty.add(parts[0]);
+          else return;
+        }
+        schedule();
       });
       watcher = next;
       identity = nextIdentity;
       next.on("error", (error) => { if (watcher === next) failed(error); });
       next.on("close", () => { if (watcher === next) { watcher = undefined; identity = undefined; } });
+      // Seed names only, once per attachment, before queued native events run.
+      // This also means pre-existing sessions' first append is not a creation.
+      const baseline = new Map<string, Set<string>>();
+      for (const project of readdirSync(root, { withFileTypes: true })) {
+        if (!project.isDirectory() && !project.isSymbolicLink()) continue;
+        try {
+          const names = jsonlNames(readdirSync(join(root, project.name)));
+          if (names.size) baseline.set(project.name, names);
+        } catch (error) { if (!missing(error)) throw error; }
+      }
+      inventory = baseline;
       warned = false;
       return true;
     } catch (error) {
@@ -76,7 +143,6 @@ export function createSessionListWatcher(root: string, invalidate: () => void, o
 
   attach();
   // Retry absent/replaced roots and failed watchers without creating directories.
-  // Degraded mode still makes the existing client poll rescan at most every 30s.
   const timer = setInterval(() => {
     if (attach()) changed(); // A recovered watch may have missed changes.
     if (!watcher && Date.now() - lastFallback >= fallbackMs) {
@@ -86,7 +152,7 @@ export function createSessionListWatcher(root: string, invalidate: () => void, o
   }, options.retryMs ?? 5_000);
   timer.unref?.();
   return {
-    kind: "session-discovery" as const,
+    kind: "session-discovery-membership" as const,
     root,
     close() {
       stopped = true;
@@ -105,7 +171,7 @@ declare global {
 export function ensureSessionListWatcher(root: string, invalidate: () => void): void {
   root = resolve(root);
   if (globalThis.__piSessionListWatcher?.root === root
-    && globalThis.__piSessionListWatcher.kind === "session-discovery") return;
+    && globalThis.__piSessionListWatcher.kind === "session-discovery-membership") return;
   globalThis.__piSessionListWatcher?.close();
   globalThis.__piSessionListWatcher = createSessionListWatcher(root, invalidate);
 }
