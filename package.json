@@ -1,6 +1,9 @@
 {
-  "name": "@agegr/pi-web",
+  "name": "@arkkwang/pi-web",
   "version": "0.10.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Web UI for the pi coding agent",
   "homepage": "https://github.com/agegr/pi-web#readme",
   "repository": {
