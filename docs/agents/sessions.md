@@ -59,3 +59,10 @@ On mount `useAgentSession` loads the history, then `GET /api/sessions/[id]/state
 
 ## Exported session HTML
 - `/api/sessions/[id]/export` delegates to pi's export helper, then makes the generated HTML's recursive tree helpers iterative, so very deep linear sessions do not overflow the browser call stack.
+
+## External session file discovery
+- `lib/session-list-watch.ts` starts one process-wide watch at `getAgentDir()/sessions` after the first list/version read. It uses the fixed SDK layout, `sessions/<cwd>/*.jsonl`, without maintaining a separate directory tree or filename inventory. It never opens an AgentSession.
+- Only `rename` notifications (file creation/deletion/rename and cwd directory changes) invalidate the list cache/version, coalesced over 250 ms. Existing JSONL content appends (`change`) are ignored: refreshing the catalogue for every message can continually invalidate an in-flight scan. Unknown rename paths conservatively invalidate; paths below the supported depth are ignored.
+- The foreground sidebar's existing 2.5 s poll observes version changes and reloads the catalogue. The watcher is shared through `globalThis`, with non-persistent handles/timers. Missing/replaced roots and watch errors are retried every 5 s; while unavailable, invalidation falls back to every 30 s. Native filesystem notification delivery remains platform-dependent, particularly on remote mounts/symlinks; silent event loss is not guaranteed to be detected.
+- This is new-session discovery, not live transcript following or runtime ownership. Open-chat refresh and control retain their existing behavior. The installed SDK 1.0.0 persists the first user message without waiting for an assistant reply.
+- `session-list-watch.integration.test.mjs` uses an independent SDK writer process and actual list/running routes: creation advances the version before cache expiry, appends do not advance it, deletion refreshes the catalogue, and an initially absent root recovers. Unit tests cover filtering, event coalescing, singleton reuse and watch failure/recovery.
