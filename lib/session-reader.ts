@@ -14,6 +14,7 @@ import { MAX_TOOL_RESULT_IMAGE_BYTES, TOOL_RESULT_IMAGE_MIMES } from "./tool-res
 import { resolveProject, type ProjectInfo } from "./worktree";
 import { readSubagentRun, SUBAGENT_META_TYPE } from "./subagents";
 import { listSessionsIncremental, type ScannedSessionInfo } from "./session-list-scanner";
+import { ensureSessionListWatcher } from "./session-list-watch";
 
 export { getAgentDir };
 
@@ -250,10 +251,12 @@ async function loadAllSessions(): Promise<SessionInfo[]> {
  * counts, names, and first messages afterwards.
  */
 export async function listSessionSummaries(): Promise<SessionInfo[]> {
+  ensureSessionListWatcher(defaultSessionsDir(), invalidateSessionListCache);
   return buildSessionList(await listSessionsIncremental({ deferDetails: true }));
 }
 
 export async function listAllSessions(options: { force?: boolean; allowStale?: boolean } = {}): Promise<SessionInfo[]> {
+  ensureSessionListWatcher(defaultSessionsDir(), invalidateSessionListCache);
   if (options.force) invalidateSessionListCache();
   const generation = globalThis.__piSessionListGeneration ?? 0;
 
@@ -409,6 +412,7 @@ export function invalidateSessionListCache(): void {
 }
 
 export function getSessionListVersion(): number {
+  ensureSessionListWatcher(defaultSessionsDir(), invalidateSessionListCache);
   return globalThis.__piSessionListGeneration ?? 0;
 }
 
