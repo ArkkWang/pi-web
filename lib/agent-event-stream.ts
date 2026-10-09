@@ -7,6 +7,7 @@ import { acquireSessionLivenessLease } from "./session-liveness";
 
 export interface AgentEventStreamSession {
   readonly isStreaming: boolean;
+  readonly fileWatching?: boolean;
   readonly streamingMessage: unknown;
   isAlive?(): boolean;
   onEvent(listener: (event: AgentEventLike) => void): () => void;
@@ -267,6 +268,7 @@ export function createAgentEventStream(
             type: "connected",
             sessionId,
             isStreaming: session.isStreaming,
+            ...(session.fileWatching ? { fileWatching: true } : {}),
             // onEvent() has just replayed every request the session still holds,
             // so a reconnecting client can drop the ones closed while it was away.
             pendingExtensionUiIds: bufferedEvents

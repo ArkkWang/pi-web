@@ -1,6 +1,20 @@
 import { readdirSync, statSync, watch, type FSWatcher } from "node:fs";
 import { readdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { sessionPathKey } from "./session-path";
+
+// Shared across route bundles/HMR; subscriptions do not allocate native watchers.
+const subscriptions = (globalThis.__piSessionFileSubscriptions ??= new Map<string, Set<() => void>>());
+export function subscribeSessionFile(filePath: string, listener: () => void): () => void {
+  const key = sessionPathKey(resolve(filePath));
+  const listeners = subscriptions.get(key) ?? new Set<() => void>();
+  listeners.add(listener);
+  subscriptions.set(key, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (!listeners.size && subscriptions.get(key) === listeners) subscriptions.delete(key);
+  };
+}
 
 type WatchOptions = {
   debounceMs?: number;
@@ -32,6 +46,16 @@ export function createSessionListWatcher(root: string, invalidate: () => void, o
   let identity: string | undefined;
   let inventory = new Map<string, Set<string>>();
   const dirty = new Set<string>();
+  const changedFiles = new Set<string>();
+  const rootKey = sessionPathKey(resolve(root));
+  const markFiles = (filename?: string | Buffer | null) => {
+    const target = filename == null ? null : sessionPathKey(resolve(root, filename.toString()));
+    for (const key of subscriptions.keys()) {
+      const rel = relative(rootKey, key);
+      if (isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`) || rel === "") continue;
+      if (target === null || key === target || sessionPathKey(dirname(key)) === target) changedFiles.add(key);
+    }
+  };
   let full = false;
   let force = false;
   let scanning = false;
@@ -72,6 +96,14 @@ export function createSessionListWatcher(root: string, invalidate: () => void, o
     const projects = [...dirty];
     full = force = false;
     dirty.clear();
+    const files = [...changedFiles];
+    changedFiles.clear();
+    for (const key of files) {
+      for (const listener of subscriptions.get(key) ?? []) {
+        try { listener(); }
+        catch (error) { console.warn("[pi-web] session file subscriber failed", error); }
+      }
+    }
     try {
       const next = checkAll ? new Map<string, Set<string>>() : new Map(inventory);
       for (const project of checkAll ? await readNames(root) : projects) {
@@ -96,7 +128,7 @@ export function createSessionListWatcher(root: string, invalidate: () => void, o
       if (dirty.size || full || force) schedule();
     }
   };
-  const changed = () => { force = true; full = true; schedule(); };
+  const changed = () => { force = true; full = true; markFiles(); schedule(); };
   const attach = () => {
     if (stopped) return;
     try {
@@ -109,11 +141,14 @@ export function createSessionListWatcher(root: string, invalidate: () => void, o
         if (stopped || watcher !== next) return;
         // Neither "rename" nor "change" proves membership changed. In particular,
         // macOS recursive watches may report every append as "rename".
-        if (filename == null) full = true;
+        if (filename == null) { full = true; markFiles(); }
         else {
           const parts = filename.toString().replaceAll("\\", "/").split("/");
-          if (parts.some(part => !part || part === "." || part === "..")) full = true;
-          else if (parts.length === 1 || (parts.length === 2 && parts[1].endsWith(".jsonl"))) dirty.add(parts[0]);
+          if (parts.some(part => !part || part === "." || part === "..")) { full = true; markFiles(); }
+          else if (parts.length === 1 || (parts.length === 2 && parts[1].endsWith(".jsonl"))) {
+            dirty.add(parts[0]);
+            markFiles(parts.join("/"));
+          }
           else return;
         }
         schedule();
@@ -152,7 +187,7 @@ export function createSessionListWatcher(root: string, invalidate: () => void, o
   }, options.retryMs ?? 5_000);
   timer.unref?.();
   return {
-    kind: "session-discovery-membership" as const,
+    kind: "session-discovery-and-content" as const,
     root,
     close() {
       stopped = true;
@@ -164,6 +199,7 @@ export function createSessionListWatcher(root: string, invalidate: () => void, o
 }
 
 declare global {
+  var __piSessionFileSubscriptions: Map<string, Set<() => void>> | undefined;
   var __piSessionListWatcher: ReturnType<typeof createSessionListWatcher> | undefined;
 }
 
@@ -171,7 +207,7 @@ declare global {
 export function ensureSessionListWatcher(root: string, invalidate: () => void): void {
   root = resolve(root);
   if (globalThis.__piSessionListWatcher?.root === root
-    && globalThis.__piSessionListWatcher.kind === "session-discovery-membership") return;
+    && globalThis.__piSessionListWatcher.kind === "session-discovery-and-content") return;
   globalThis.__piSessionListWatcher?.close();
   globalThis.__piSessionListWatcher = createSessionListWatcher(root, invalidate);
 }

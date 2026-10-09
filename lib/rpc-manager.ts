@@ -1943,6 +1943,24 @@ function getRegistry(): Map<string, AgentSessionWrapper> {
   return globalThis.__piSessions;
 }
 
+// Browsers observing a file can attach before the first locally initiated run.
+// Registering a listener never starts a session or inspects an external process.
+declare global {
+  var __piRpcRegistrationListeners: Map<string, Set<(session: AgentSessionWrapper) => void>> | undefined;
+}
+export function onRpcSessionRegistered(id: string, listener: (session: AgentSessionWrapper) => void): () => void {
+  const registry = (globalThis.__piRpcRegistrationListeners ??= new Map());
+  const listeners = registry.get(id) ?? new Set();
+  listeners.add(listener);
+  registry.set(id, listeners);
+  const existing = getRpcSession(id);
+  if (existing?.isAlive()) listener(existing);
+  return () => {
+    listeners.delete(listener);
+    if (!listeners.size && registry.get(id) === listeners) registry.delete(id);
+  };
+}
+
 function registerRpcWrapper(wrapper: AgentSessionWrapper): void {
   const registry = getRegistry();
   const sessionId = wrapper.sessionId;
@@ -1961,6 +1979,10 @@ function registerRpcWrapper(wrapper: AgentSessionWrapper): void {
   registry.set(sessionId, wrapper);
   wrapper.start();
   if (!wrapper.isChatOnly()) wrapper.beginExtensionBinding();
+  for (const listener of globalThis.__piRpcRegistrationListeners?.get(sessionId) ?? []) {
+    try { listener(wrapper); }
+    catch (error) { console.warn("[pi-web] session registration subscriber failed", error); }
+  }
 }
 
 const SUBAGENT_CONTROLLER = createSubagentController({

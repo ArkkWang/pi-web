@@ -1,6 +1,9 @@
 import { createAgentEventStream } from "@/lib/agent-event-stream";
-import { resolveSessionPath } from "@/lib/session-reader";
-import { getRpcSession, startRpcSession } from "@/lib/rpc-manager";
+import { getAgentDir, invalidateSessionListCache, invalidateSessionManagerCache, resolveSessionPath } from "@/lib/session-reader";
+import { getRpcSession, onRpcSessionRegistered, startRpcSession } from "@/lib/rpc-manager";
+import { createSessionFileObserver } from "@/lib/session-file-events";
+import { ensureSessionListWatcher, subscribeSessionFile } from "@/lib/session-list-watch";
+import { join } from "node:path";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +26,18 @@ export async function GET(
       return new Response("Session not found", { status: 404 });
     }
     if (req.signal.aborted) return new Response(null, { status: 204 });
-    sessionPromise = startRpcSession(id, filePath, undefined).then((result) => result.session);
+    if (new URL(req.url).searchParams.get("observe") === "1") {
+      ensureSessionListWatcher(join(getAgentDir(), "sessions"), invalidateSessionListCache);
+      sessionPromise = Promise.resolve(createSessionFileObserver({
+        subscribeFile: (listener) => subscribeSessionFile(filePath, () => {
+          invalidateSessionManagerCache(filePath);
+          listener();
+        }),
+        subscribeRuntime: (listener) => onRpcSessionRegistered(id, listener),
+      }));
+    } else {
+      sessionPromise = startRpcSession(id, filePath, undefined).then((result) => result.session);
+    }
   }
 
   const stream = createAgentEventStream(req, id, sessionPromise);

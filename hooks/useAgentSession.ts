@@ -26,6 +26,7 @@ import { CONFIGURED_TOOL_PRESET, getPresetFromToolNames, getToolNamesForPreset, 
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import { mergeSessionStats, type SessionFileStats } from "@/lib/session-stats";
 import { userMessageKey } from "@/lib/prompt-recovery";
+import { createSessionFileRefresh } from "@/lib/session-file-refresh";
 import { AgentEventConnection } from "@/lib/agent-event-connection";
 import { isNestedToolExecutionEvent, isSystemMessageEvent } from "@/lib/agent-event-wire";
 import { getToolExecutionProgress } from "@/lib/tool-execution-progress";
@@ -422,7 +423,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const modelSwitchPendingRef = useRef(false);
   const draftKeyAliasesRef = useRef(new Map<string, string>());
   const sessionHookMountedRef = useRef(true);
-  // In-flight session reads, keyed by session id (or force:<id> for fresh reads).
+  const fileWatchingRef = useRef(false);
+  const fileRefreshRef = useRef<ReturnType<typeof createSessionFileRefresh> | null>(null);
+  // In-flight reads: normal, forced mount, and file-refresh lanes.
   const loadFlightsRef = useRef(new Map<string, Promise<unknown>>());
   // Latest settled view state, readable from the unmount cleanup without
   // re-subscribing it. Assigned every render like sessionPropIdRef below.
@@ -443,7 +446,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   if (!eventConnectionRef.current) {
     eventConnectionRef.current = new AgentEventConnection({
-      createSource: (sid) => new EventSource(`/api/agent/${encodeURIComponent(sid)}/events`),
+      createSource: (sid) => new EventSource(`/api/agent/${encodeURIComponent(sid)}/events?observe=1`),
       onEvent: (event) => handleAgentEventRef.current?.(event as AgentEvent),
       shouldMaintain: (sid) => (
         sessionHookMountedRef.current
@@ -599,10 +602,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [applyContextUsage]);
 
-  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean }) => {
+  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean; fileRefresh?: boolean; signal?: AbortSignal }) => {
     // Single-flight: concurrent reads for the same session (mount + SSE settle +
     // reconcile) share one request unless the caller forces a fresh read.
-    const flightKey = options?.force ? `force:${sid}` : sid;
+    const flightKey = options?.fileRefresh ? `file:${sid}` : options?.force ? `force:${sid}` : sid;
     const inflight = options?.force ? undefined : loadFlightsRef.current.get(flightKey);
     if (inflight) return await inflight;
   const flight = (async (): Promise<unknown> => {
@@ -611,7 +614,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (showLoading) setLoading(true);
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1", tree: "summary" });
       if (options?.force) params.set("force", "1");
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`);
+      if (options?.fileRefresh) params.set("tail", String(Math.max(50, entryIdsRef.current.length)));
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`, { signal: options?.signal });
       if (res.status === 404) {
         if (showLoading) {
           setData(null);
@@ -627,7 +631,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
-      if (sessionIdRef.current !== sid) return null;
+      if (sessionIdRef.current !== sid || !sessionHookMountedRef.current || options?.signal?.aborted) return null;
+      if (options?.fileRefresh && (!fileWatchingRef.current || agentRunningRef.current)) return null;
       // Freshness check: when the disk snapshot is unchanged (same opaque
       // revision), keep any history the user already paged in instead of
       // collapsing back to the fresh 50-entry window. The state hooks then
@@ -738,18 +743,47 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return null;
       }
     } catch (e) {
-      setError(String(e));
+      if (!options?.fileRefresh) setError(String(e));
       return "error";
     } finally {
       if (showLoading && !messagesLoaded) setLoading(false);
     }
     })();
-    if (!options?.force) loadFlightsRef.current.set(flightKey, flight);
+    loadFlightsRef.current.set(flightKey, flight);
     flight.finally(() => {
       if (loadFlightsRef.current.get(flightKey) === flight) loadFlightsRef.current.delete(flightKey);
     });
     return await flight;
   }, [applyContextUsage, setToolPresetState, syncLiveModel]);
+
+  useEffect(() => {
+    const sid = session?.id;
+    if (!sid) return;
+    const controller = new AbortController();
+    const queue = createSessionFileRefresh({
+      enabled: () => fileWatchingRef.current && !agentRunningRef.current
+        && sessionIdRef.current === sid && document.visibilityState === "visible",
+      refresh: async () => {
+        // Do not let a slower mount response overwrite a newer file snapshot.
+        await loadFlightsRef.current.get(`force:${sid}`);
+        if (controller.signal.aborted || !fileWatchingRef.current || agentRunningRef.current || sessionIdRef.current !== sid) return true;
+        return (await loadSession(sid, false, false, { fileRefresh: true, signal: controller.signal })) !== "error";
+      },
+    });
+    fileRefreshRef.current = queue;
+    // Covers an initial SSE notification arriving before this effect attaches.
+    queue.invalidate();
+    const onVisible = () => { if (document.visibilityState === "visible") queue.invalidate(); };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("online", onVisible);
+    return () => {
+      queue.dispose();
+      controller.abort();
+      if (fileRefreshRef.current === queue) fileRefreshRef.current = null;
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("online", onVisible);
+    };
+  }, [loadSession, session?.id]);
 
   const loadContext = useCallback(async (sid: string, leafId: string | null, before?: string | null, options?: { tail?: number; signal?: AbortSignal }) => {
     try {
@@ -1373,7 +1407,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const handleAgentEvent = useCallback((event: AgentEvent) => {
     switch (event.type) {
+      case "session_file_changed":
+        fileRefreshRef.current?.invalidate();
+        break;
       case "connected": {
+        fileWatchingRef.current = event.fileWatching === true;
+        if (fileWatchingRef.current) fileRefreshRef.current?.invalidate();
         dispatch({ type: "end" });
         if (Array.isArray(event.pendingExtensionUiIds)) {
           // The server replays what it still holds right after this event.
